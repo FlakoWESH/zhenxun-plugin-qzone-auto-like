@@ -39,6 +39,8 @@ def _init_cookie_refresher():
         bridge_url=Config.get_config("qzone_auto_like", "bridge_url", "http://127.0.0.1:5700"),
         bridge_token=Config.get_config("qzone_auto_like", "bridge_token", ""),
         refresh_interval=Config.get_config("qzone_auto_like", "cookie_refresh_interval", 7200),
+        request_timeout=Config.get_config("qzone_auto_like", "cookie_request_timeout", 10),
+        verify_after_update=Config.get_config("qzone_auto_like", "cookie_verify_after_update", True),
     )
     logger.info("[qzone_auto_like] Cookie 自动刷新已启用")
 

@@ -64,5 +64,17 @@ def get_plugin_extra() -> PluginExtraData:
                 help="Cookie 自动刷新间隔（秒），默认 2 小时",
                 type=int
             ),
+            RegisterConfig(
+                key="cookie_request_timeout",
+                value=10,
+                help="HTTP 请求超时时间（秒）",
+                type=int
+            ),
+            RegisterConfig(
+                key="cookie_verify_after_update",
+                value=True,
+                help="更新后是否调用 check_cookie API 验证新 Cookie 是否有效",
+                type=bool
+            ),
         ]
     )
