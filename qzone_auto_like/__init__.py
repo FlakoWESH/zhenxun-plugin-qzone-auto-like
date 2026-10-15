@@ -1,17 +1,20 @@
-import asyncio
+import time
 from datetime import datetime
 
 import nonebot
-from nonebot import on_command, get_driver
+from nonebot import get_driver, on_command
+from nonebot.permission import SUPERUSER
 from nonebot.plugin import PluginMetadata
+from nonebot_plugin_apscheduler import scheduler
 
 from zhenxun.configs.config import Config
 from zhenxun.services.log import logger
 from zhenxun.utils.message import MessageUtils
 
+from .bridge import QzoneBridgeClient
 from .config import get_plugin_extra
 from .cookie_refresher import CookieRefresher
-from .models import QzoneLikeRecord
+from .like_service import AutoLikeService
 
 __plugin_meta__ = PluginMetadata(
     name="QQ空间说说自动点赞",
@@ -20,110 +23,163 @@ __plugin_meta__ = PluginMetadata(
     extra=get_plugin_extra().to_dict(),
 )
 
-# 标记后台任务是否已启动
-_task_started = False
+_CFG = "qzone_auto_like"
 
-# Cookie 自动刷新器
+# 运行期服务（按配置惰性构建，配置变化时自动重建）
+_bridge: QzoneBridgeClient | None = None
 _cookie_refresher: CookieRefresher | None = None
+_like_service: AutoLikeService | None = None
+_bridge_conf: tuple | None = None
+
+# 上一轮点赞时间戳
+_last_like_run: float = 0.0
 
 
-def _init_cookie_refresher():
-    """根据配置初始化 Cookie 自动刷新器"""
-    global _cookie_refresher
-    if not Config.get_config("qzone_auto_like", "enable_auto_cookie", False):
+def _get(key: str, default):
+    return Config.get_config(_CFG, key, default)
+
+
+async def _ensure_services() -> None:
+    """根据当前配置构建/重建服务实例（支持配置热更新、复用 session）。"""
+    global _bridge, _cookie_refresher, _like_service, _bridge_conf
+
+    url = _get("bridge_url", "http://127.0.0.1:5700")
+    token = _get("bridge_token", "")
+    timeout = _get("cookie_request_timeout", 10)
+    conf = (url, token, timeout)
+
+    if _bridge is None or _bridge_conf != conf:
+        if _bridge is not None:
+            await _bridge.close()
+        if _cookie_refresher is not None:
+            await _cookie_refresher.close()
+        _bridge = QzoneBridgeClient(url, token, timeout)
+        _like_service = AutoLikeService(_bridge)
+        _bridge_conf = conf
+
+    if _get("enable_auto_cookie", False):
+        if _cookie_refresher is None:
+            _cookie_refresher = CookieRefresher(
+                napcat_url=_get("napcat_url", "http://127.0.0.1:3000"),
+                napcat_token=_get("napcat_token", ""),
+                bridge_client=_bridge,
+                refresh_interval=_get("cookie_refresh_interval", 7200),
+                request_timeout=timeout,
+                verify_after_update=_get("cookie_verify_after_update", True),
+            )
+            logger.info("[qzone_auto_like] Cookie 自动刷新已启用")
+    elif _cookie_refresher is not None:
+        await _cookie_refresher.close()
+        _cookie_refresher = None
+
+
+async def _auto_like_tick() -> None:
+    """调度器周期调用：达到 like_interval 才执行一轮点赞。"""
+    global _last_like_run
+
+    if not _get("enable_auto_like", False):
         return
 
-    _cookie_refresher = CookieRefresher(
-        napcat_url=Config.get_config("qzone_auto_like", "napcat_url", "http://127.0.0.1:3000"),
-        napcat_token=Config.get_config("qzone_auto_like", "napcat_token", ""),
-        bridge_url=Config.get_config("qzone_auto_like", "bridge_url", "http://127.0.0.1:5700"),
-        bridge_token=Config.get_config("qzone_auto_like", "bridge_token", ""),
-        refresh_interval=Config.get_config("qzone_auto_like", "cookie_refresh_interval", 7200),
-        request_timeout=Config.get_config("qzone_auto_like", "cookie_request_timeout", 10),
-        verify_after_update=Config.get_config("qzone_auto_like", "cookie_verify_after_update", True),
-    )
-    logger.info("[qzone_auto_like] Cookie 自动刷新已启用")
+    interval = max(0, _get("like_interval", 600))
+    now = time.time()
+    if now - _last_like_run < interval:
+        return
+
+    try:
+        bot = nonebot.get_bot()
+    except Exception:
+        logger.warning("[qzone_auto_like] 未找到可用的 Bot 实例，跳过本轮")
+        return
+
+    _last_like_run = now
+    qq = str(bot.self_id)
+
+    await _ensure_services()
+    if _like_service is None:
+        return
+
+    max_count = _get("max_like_count", 50)
+    delay_min = _get("like_random_delay_min", 2)
+    delay_max = _get("like_random_delay_max", 6)
+    daily_limit = _get("daily_like_limit", 200)
+
+    try:
+        stats = await _like_service.run_once(
+            qq=qq,
+            max_count=max_count,
+            delay_min=delay_min,
+            delay_max=delay_max,
+            daily_limit=daily_limit,
+        )
+        logger.info(
+            "[qzone_auto_like] 点赞轮次完成 | 抓取=%s 点赞=%s 跳过=%s 失败=%s 达上限=%s",
+            stats["fetched"],
+            stats["liked"],
+            stats["skipped"],
+            stats["failed"],
+            stats["limit_reached"],
+        )
+    except Exception as e:  # noqa: BLE001 - 主循环兜底，避免调度任务被移除
+        logger.error("[qzone_auto_like] 自动点赞出现错误: %s", e)
 
 
-async def _auto_like_loop():
-    """自动点赞后台循环任务"""
-    logger.info("[qzone_auto_like] 自动点赞任务已启动")
-    while True:
-        try:
-            if not Config.get_config("qzone_auto_like", "enable_auto_like", True):
-                await asyncio.sleep(60)
-                continue
-
-            interval = Config.get_config("qzone_auto_like", "like_interval", 600)
-            max_count = Config.get_config("qzone_auto_like", "max_like_count", 50)
-
-            # 获取当前bot实例
-            try:
-                bot = nonebot.get_bot()
-            except Exception:
-                logger.warning("[qzone_auto_like] 未找到可用的Bot实例，等待重连...")
-                await asyncio.sleep(30)
-                continue
-
-            qq = bot.self_id
-            logger.info(
-                "[qzone_auto_like] 开始一轮空间说说点赞 | QQ: %s | 最大数量: %d",
-                qq,
-                max_count,
-            )
-
-            # 尝试导入onebot_qzone并执行点赞
-            try:
-                from onebot_qzone import QzoneSession
-
-                qzone = QzoneSession(qq)
-                await qzone.login()
-                posts = await qzone.get_user_timeline(count=max_count)
-                for post in posts:
-                    await qzone.like(post["postid"])
-                    await QzoneLikeRecord.create(
-                        qq_number=qq,
-                        qzone_post_id=post["postid"],
-                        like_time=datetime.now(),
-                    )
-                    await asyncio.sleep(1)
-                logger.info("[qzone_auto_like] 完成一轮QQ空间说说点赞")
-            except ImportError:
-                logger.error(
-                    "[qzone_auto_like] 未安装onebot-qzone库，请执行 pip install onebot-qzone"
-                )
-                await asyncio.sleep(interval)
-                continue
-            except Exception as e:
-                logger.error("[qzone_auto_like] 点赞过程出现错误: %s", str(e))
-
-            await asyncio.sleep(interval)
-        except Exception as e:
-            logger.error("[qzone_auto_like] 主循环异常: %s", str(e))
-            await asyncio.sleep(60)
+async def _cookie_tick() -> None:
+    """调度器周期调用：到点才检查/刷新 Cookie。"""
+    if not _get("enable_auto_cookie", False):
+        return
+    await _ensure_services()
+    if _cookie_refresher is None:
+        return
+    try:
+        await _cookie_refresher.maybe_refresh()
+    except Exception as e:  # noqa: BLE001
+        logger.error("[qzone_auto_like] Cookie 检查出现错误: %s", e)
 
 
-status_cmd = on_command("空间点赞状态", priority=5, block=True)
+status_cmd = on_command("空间点赞状态", permission=SUPERUSER, priority=5, block=True)
 
 
 @status_cmd.handle()
 async def _():
     """查询自动点赞状态"""
-    enabled = Config.get_config("qzone_auto_like", "enable_auto_like", True)
-    status = "已启用" if enabled else "已禁用"
+    await _ensure_services()
 
-    msg = f"QQ空间自动点赞状态\n功能开关：{status}\n"
+    like_enabled = _get("enable_auto_like", False)
+    cookie_enabled = _get("enable_auto_cookie", False)
 
-    if _cookie_refresher is not None:
+    msg = (
+        "QQ空间自动点赞状态\n"
+        f"自动点赞：{'已启用' if like_enabled else '已禁用'}\n"
+        f"点赞间隔：{_get('like_interval', 600)} 秒\n"
+        f"单轮上限：{_get('max_like_count', 50)} 条\n"
+        f"每日上限：{_get('daily_like_limit', 200) or '不限'}\n"
+    )
+
+    try:
+        from .models import QzoneLikeRecord
+
+        today_count = await QzoneLikeRecord.filter(
+            qq_number=str(nonebot.get_bot().self_id),
+            like_time__gte=datetime.now().replace(
+                hour=0, minute=0, second=0, microsecond=0
+            ),
+        ).count()
+        msg += f"今日已点赞：{today_count} 条\n"
+    except Exception:  # noqa: BLE001
+        pass
+
+    if cookie_enabled and _cookie_refresher is not None:
         s = _cookie_refresher.get_status()
-        msg += f"\n─── Cookie 自动刷新 ───\n"
+        msg += "\n─── Cookie 自动刷新 ───\n"
         msg += f"刷新间隔：{s['refresh_interval']} 秒\n"
         if s["last_refresh_time"]:
-            last_time = datetime.fromtimestamp(s["last_refresh_time"]).strftime("%Y-%m-%d %H:%M:%S")
+            last_time = datetime.fromtimestamp(s["last_refresh_time"]).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
             if s["last_refresh_success"]:
-                msg += f"上次刷新：{last_time} ✅ 成功\n"
+                msg += f"上次刷新：{last_time} 成功\n"
             else:
-                msg += f"上次刷新：{last_time} ❌ 失败\n错误：{s['last_error'] or '未知'}\n"
+                msg += f"上次刷新：{last_time} 失败\n错误：{s['last_error'] or '未知'}\n"
         else:
             msg += "上次刷新：尚未执行\n"
         msg += f"累计刷新：{s['refresh_count']} 次"
@@ -133,18 +189,35 @@ async def _():
     await MessageUtils.build_message(msg).finish()
 
 
-# 插件加载时初始化
-_init_cookie_refresher()
-
 driver = get_driver()
 
 
 @driver.on_startup
 async def _startup():
-    global _task_started
-    if not _task_started:
-        _task_started = True
-        asyncio.create_task(_auto_like_loop())
-        if _cookie_refresher is not None:
-            asyncio.create_task(_cookie_refresher.refresh_loop())
-            logger.info("[qzone_auto_like] Cookie 自动刷新后台任务已启动")
+    scheduler.add_job(
+        _auto_like_tick,
+        "interval",
+        seconds=30,
+        id="qzone_auto_like_tick",
+        max_instances=1,
+        coalesce=True,
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        _cookie_tick,
+        "interval",
+        seconds=60,
+        id="qzone_auto_cookie_tick",
+        max_instances=1,
+        coalesce=True,
+        replace_existing=True,
+    )
+    logger.info("[qzone_auto_like] 后台调度任务已注册")
+
+
+@driver.on_shutdown
+async def _shutdown():
+    if _cookie_refresher is not None:
+        await _cookie_refresher.close()
+    elif _bridge is not None:
+        await _bridge.close()
