@@ -54,13 +54,13 @@ def get_plugin_extra() -> PluginExtraData:
             RegisterConfig(
                 key="enable_auto_cookie",
                 value=False,
-                help="是否启用自动从 NapCat 获取 QQ 空间 Cookie（需 NapCat HTTP API 和 onebot-qzone 桥接服务）",
+                help="是否启用自动获取 QQ 空间 Cookie（优先复用 OneBot 连接，无需额外 HTTP 服务）",
                 type=bool,
             ),
             RegisterConfig(
                 key="napcat_url",
                 value="http://127.0.0.1:3000",
-                help="NapCat HTTP API 地址",
+                help="NapCat HTTP API 地址（仅当 OneBot 连接不可用时作为回退）",
                 type=str,
             ),
             RegisterConfig(

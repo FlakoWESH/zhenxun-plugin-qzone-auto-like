@@ -3,6 +3,7 @@ from datetime import datetime
 
 import nonebot
 from nonebot import get_driver, on_command
+from nonebot.adapters.onebot.v11 import Bot
 from nonebot.permission import SUPERUSER
 from nonebot.plugin import PluginMetadata
 from nonebot_plugin_apscheduler import scheduler
@@ -39,6 +40,22 @@ def _get(key: str, default):
     return Config.get_config(_CFG, key, default)
 
 
+def _get_bot():
+    try:
+        return nonebot.get_bot()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _cookie_ready() -> bool:
+    """自动 Cookie 开启时，是否已经成功刷新过一次。"""
+    if not _get("enable_auto_cookie", False):
+        return True
+    if _cookie_refresher is None:
+        return False
+    return bool(_cookie_refresher.get_status().get("last_refresh_success"))
+
+
 async def _ensure_services() -> None:
     """根据当前配置构建/重建服务实例（支持配置热更新、复用 session）。"""
     global _bridge, _cookie_refresher, _like_service, _bridge_conf
@@ -66,6 +83,7 @@ async def _ensure_services() -> None:
                 refresh_interval=_get("cookie_refresh_interval", 7200),
                 request_timeout=timeout,
                 verify_after_update=_get("cookie_verify_after_update", True),
+                bot_getter=_get_bot,
             )
             logger.info("[qzone_auto_like] Cookie 自动刷新已启用")
     elif _cookie_refresher is not None:
@@ -79,6 +97,13 @@ async def _auto_like_tick() -> None:
 
     if not _get("enable_auto_like", False):
         return
+
+    if _get("enable_auto_cookie", False):
+        await _ensure_services()
+        if not _cookie_ready() and _cookie_refresher is not None:
+            await _cookie_refresher.maybe_refresh()
+        if not _cookie_ready():
+            return
 
     interval = max(0, _get("like_interval", 600))
     now = time.time()
@@ -112,15 +137,12 @@ async def _auto_like_tick() -> None:
             daily_limit=daily_limit,
         )
         logger.info(
-            "[qzone_auto_like] 点赞轮次完成 | 抓取=%s 点赞=%s 跳过=%s 失败=%s 达上限=%s",
-            stats["fetched"],
-            stats["liked"],
-            stats["skipped"],
-            stats["failed"],
-            stats["limit_reached"],
+            f"[qzone_auto_like] 点赞轮次完成 | 抓取={stats['fetched']} "
+            f"点赞={stats['liked']} 跳过={stats['skipped']} "
+            f"失败={stats['failed']} 达上限={stats['limit_reached']}"
         )
     except Exception as e:  # noqa: BLE001 - 主循环兜底，避免调度任务被移除
-        logger.error("[qzone_auto_like] 自动点赞出现错误: %s", e)
+        logger.error(f"[qzone_auto_like] 自动点赞出现错误: {e}")
 
 
 async def _cookie_tick() -> None:
@@ -133,7 +155,7 @@ async def _cookie_tick() -> None:
     try:
         await _cookie_refresher.maybe_refresh()
     except Exception as e:  # noqa: BLE001
-        logger.error("[qzone_auto_like] Cookie 检查出现错误: %s", e)
+        logger.error(f"[qzone_auto_like] Cookie 检查出现错误: {e}")
 
 
 status_cmd = on_command("空间点赞状态", permission=SUPERUSER, priority=5, block=True)
@@ -213,6 +235,16 @@ async def _startup():
         replace_existing=True,
     )
     logger.info("[qzone_auto_like] 后台调度任务已注册")
+
+
+@driver.on_bot_connect
+async def _on_bot_connect(_bot: Bot) -> None:
+    """Bot 连接 NapCat 后立即刷新 Cookie，避免首轮点赞因无 Cookie 失败。"""
+    if not _get("enable_auto_cookie", False):
+        return
+    await _ensure_services()
+    if _cookie_refresher is not None:
+        await _cookie_refresher.maybe_refresh()
 
 
 @driver.on_shutdown

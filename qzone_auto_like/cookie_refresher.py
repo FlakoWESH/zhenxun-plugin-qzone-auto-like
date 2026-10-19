@@ -3,6 +3,9 @@
 通过 NapCat 的 get_cookies API 自动获取 QQ 空间 Cookie，
 再调用 onebot-qzone 桥接服务的 update_cookie action 动态更新 Cookie。
 
+Cookie 优先通过真寻已有的 OneBot 连接向 NapCat 请求，无需额外开启
+NapCat HTTP API；仅当 OneBot 连接不可用时回退到 HTTP。
+
 工作流程（按需刷新）：
 1. 调用桥接服务 check_cookie（带网络探针）检测当前 Cookie 是否有效
 2. Cookie 仍有效 -> 跳过，不触发任何变更（防风控）
@@ -11,13 +14,14 @@
 
 前提条件：
 - NapCat 版本 >= v4.18.0（修复了 bkn 计算 bug）
-- NapCat 已登录 QQ，且开启了 HTTP API
+- NapCat 已登录 QQ，并已连接到真寻
 - onebot-qzone 桥接服务正在运行（v2.0.0+，支持 check_cookie / update_cookie）
 """
 from __future__ import annotations
 
 import time
-from typing import TYPE_CHECKING
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any
 
 import aiohttp
 from zhenxun.services.log import logger
@@ -40,6 +44,7 @@ class CookieRefresher:
         refresh_interval: int = 7200,
         request_timeout: int = 10,
         verify_after_update: bool = True,
+        bot_getter: Callable[[], Any] | None = None,
     ):
         self.napcat_url = napcat_url.rstrip("/")
         self.napcat_token = napcat_token or ""
@@ -47,6 +52,7 @@ class CookieRefresher:
         self.refresh_interval = refresh_interval
         self.request_timeout = request_timeout
         self.verify_after_update = verify_after_update
+        self._bot_getter = bot_getter
 
         self._last_refresh_time: float | None = None
         self._last_refresh_success: bool | None = None
@@ -90,14 +96,55 @@ class CookieRefresher:
         self._last_check_message = result["message"]
         return result
 
+    async def fetch_cookie_from_bot(self) -> str:
+        """通过真寻现有的 OneBot 连接向 NapCat 请求 QQ 空间 Cookie。"""
+        bot = self._bot_getter() if self._bot_getter else None
+        if bot is None:
+            raise RuntimeError("当前没有可用的 OneBot Bot 连接")
+
+        logger.info("[qzone_auto_like] 正在通过 OneBot 连接获取 QQ 空间 Cookie")
+        data = await bot.call_api("get_cookies", domain="user.qzone.qq.com")
+        cookies_str = ""
+        if isinstance(data, dict):
+            cookies_str = str(data.get("cookies") or "")
+        if not cookies_str:
+            raise RuntimeError("OneBot get_cookies 返回数据中缺少 cookies 字段")
+
+        missing = self._check_required_fields(cookies_str)
+        if missing:
+            raise RuntimeError(
+                f"Cookie 缺少必要字段: {', '.join(missing)}。"
+                f"请确认 NapCat 已正确登录 QQ 且版本 >= v4.18.0"
+            )
+        return cookies_str
+
+    async def fetch_cookie(self) -> str:
+        """获取 Cookie：优先走 OneBot 连接，失败时回退 NapCat HTTP API。"""
+        errors: list[str] = []
+        if self._bot_getter is not None:
+            try:
+                return await self.fetch_cookie_from_bot()
+            except Exception as e:  # noqa: BLE001 - 回退到 HTTP
+                errors.append(f"OneBot: {e}")
+                logger.warning(
+                    f"[qzone_auto_like] 通过 OneBot 获取 Cookie 失败，"
+                    f"尝试 HTTP 回退: {e}"
+                )
+
+        try:
+            return await self.fetch_cookie_from_napcat()
+        except Exception as e:
+            errors.append(f"HTTP: {e}")
+            raise RuntimeError("; ".join(errors)) from e
+
     async def fetch_cookie_from_napcat(self) -> str:
-        """调用 NapCat 的 get_cookies API 获取 QQ 空间 Cookie。"""
+        """调用 NapCat 的 HTTP get_cookies API 获取 QQ 空间 Cookie。"""
         url = f"{self.napcat_url}/get_cookies"
         headers = {"Content-Type": "application/json"}
         if self.napcat_token:
             headers["Authorization"] = f"Bearer {self.napcat_token}"
 
-        logger.info("[qzone_auto_like] 正在从 NapCat 获取 QQ 空间 Cookie: %s", url)
+        logger.info(f"[qzone_auto_like] 正在从 NapCat 获取 QQ 空间 Cookie: {url}")
 
         session = await self._get_napcat_session()
         async with session.post(
@@ -145,7 +192,7 @@ class CookieRefresher:
                     check_result = await self.check_cookie_on_bridge()
                 except Exception as e:  # noqa: BLE001 - 预检失败不阻断刷新（fail-open）
                     logger.warning(
-                        "[qzone_auto_like] Cookie 预检失败（%s），改为直接刷新", e
+                        f"[qzone_auto_like] Cookie 预检失败（{e}），改为直接刷新"
                     )
                 else:
                     if check_result["valid"]:
@@ -154,27 +201,27 @@ class CookieRefresher:
                             age_sec = check_result["cookie_age_seconds"]
                             age_min = f"，Cookie 年龄={round(age_sec / 60)} 分钟"
                         logger.info(
-                            "[qzone_auto_like] 当前 Cookie 仍有效%s，无需刷新，跳过。",
-                            age_min,
+                            f"[qzone_auto_like] 当前 Cookie 仍有效{age_min}，"
+                            f"无需刷新，跳过。"
                         )
                         self._last_refresh_time = time.time()
                         self._last_refresh_success = True
                         self._last_error = None
                         return True, None
                     logger.info(
-                        "[qzone_auto_like] 当前 Cookie 已失效：%s，开始刷新...",
-                        check_result["message"],
+                        f"[qzone_auto_like] 当前 Cookie 已失效："
+                        f"{check_result['message']}，开始刷新..."
                     )
 
-            cookie_str = await self.fetch_cookie_from_napcat()
-            logger.info("[qzone_auto_like] 成功获取 Cookie，长度=%d", len(cookie_str))
+            cookie_str = await self.fetch_cookie()
+            logger.info(f"[qzone_auto_like] 成功获取 Cookie，长度={len(cookie_str)}")
 
             inner = await self.bridge.update_cookie(cookie_str)
             logger.info(
-                "[qzone_auto_like] Cookie 热更新成功！QQ号=%s, 昵称=%s, %s",
-                inner.get("user_id", 0),
-                inner.get("nickname", ""),
-                inner.get("message", "Cookie 已更新"),
+                f"[qzone_auto_like] Cookie 热更新成功！"
+                f"QQ号={inner.get('user_id', 0)}, "
+                f"昵称={inner.get('nickname', '')}, "
+                f"{inner.get('message', 'Cookie 已更新')}"
             )
 
             if self.verify_after_update:
@@ -182,17 +229,18 @@ class CookieRefresher:
                     verify_result = await self.check_cookie_on_bridge()
                     if verify_result["valid"]:
                         logger.info(
-                            "[qzone_auto_like] Cookie 验证通过：has_p_skey=%s, has_skey=%s",
-                            verify_result["has_p_skey"],
-                            verify_result["has_skey"],
+                            f"[qzone_auto_like] Cookie 验证通过："
+                            f"has_p_skey={verify_result['has_p_skey']}, "
+                            f"has_skey={verify_result['has_skey']}"
                         )
                     else:
                         logger.warning(
-                            "[qzone_auto_like] Cookie 验证失败：%s，请检查 update_cookie 是否真正生效",
-                            verify_result["message"],
+                            f"[qzone_auto_like] Cookie 验证失败："
+                            f"{verify_result['message']}，"
+                            f"请检查 update_cookie 是否真正生效"
                         )
                 except Exception as e:  # noqa: BLE001
-                    logger.warning("[qzone_auto_like] 更新后验证失败：%s", e)
+                    logger.warning(f"[qzone_auto_like] 更新后验证失败：{e}")
 
             self._last_refresh_time = time.time()
             self._last_refresh_success = True
@@ -205,7 +253,7 @@ class CookieRefresher:
             self._last_refresh_time = time.time()
             self._last_refresh_success = False
             self._last_error = error_msg
-            logger.error("[qzone_auto_like] Cookie 刷新失败: %s", error_msg)
+            logger.error(f"[qzone_auto_like] Cookie 刷新失败: {error_msg}")
             return False, error_msg
 
     def is_refresh_due(self) -> bool:

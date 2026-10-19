@@ -100,7 +100,7 @@ class AutoLikeService:
             if remaining <= 0:
                 stats["limit_reached"] = True
                 logger.info(
-                    "[qzone_auto_like] 已达每日点赞上限(%d)，本轮跳过", daily_limit
+                    f"[qzone_auto_like] 已达每日点赞上限({daily_limit})，本轮跳过"
                 )
                 return stats
             pending = pending[:remaining]
@@ -114,7 +114,7 @@ class AutoLikeService:
             except Exception as e:  # noqa: BLE001 - 单条失败不应中断整轮
                 stats["failed"] += 1
                 logger.warning(
-                    "[qzone_auto_like] 点赞失败 tid=%s: %s", tid, e
+                    f"[qzone_auto_like] 点赞失败 tid={tid}: {e}"
                 )
                 continue
 

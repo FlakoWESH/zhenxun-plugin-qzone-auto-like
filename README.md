@@ -8,7 +8,7 @@
 - **防重复点赞**：使用真寻数据库 + `(qq_number, qzone_post_id)` 唯一约束记录已点赞说说，不会重复点赞
 - **每日限额 + 随机延迟**：可配置每日点赞上限与单条随机间隔，降低风控风险
 - **点赞结果校验**：仅在桥接服务确认点赞成功后落库，失败的说说会在下一轮重试
-- **Cookie 自动刷新**：通过 NapCat `get_cookies` API 自动获取最新 Cookie，推送到 onebot-qzone，无需手动粘贴；按需刷新（Cookie 有效时跳过）
+- **Cookie 自动刷新**：复用真寻已有的 OneBot 连接调用 NapCat `get_cookies`，自动推送最新 Cookie 到 onebot-qzone，无需手动粘贴、无需另开 HTTP 端口；按需刷新（Cookie 有效时跳过）
 - **可配置参数**：点赞间隔、单轮上限、每日上限、随机延迟、Cookie 刷新间隔等均可在真寻管理后台配置
 - **状态查询**：发送 `空间点赞状态` 查看运行状态和 Cookie 刷新状态
 
@@ -40,8 +40,8 @@ zhenxun_bot/
 | like_random_delay_min | 2 | 单条点赞之间的最小随机延迟（秒） |
 | like_random_delay_max | 6 | 单条点赞之间的最大随机延迟（秒） |
 | daily_like_limit | 200 | 每日最多点赞条数（0 表示不限） |
-| enable_auto_cookie | false | 是否启用自动从 NapCat 获取 Cookie |
-| napcat_url | http://127.0.0.1:3000 | NapCat HTTP API 地址 |
+| enable_auto_cookie | false | 是否启用自动获取 QQ 空间 Cookie（优先复用 OneBot 连接） |
+| napcat_url | http://127.0.0.1:3000 | NapCat HTTP API 地址（仅当 OneBot 连接不可用时回退） |
 | napcat_token | 空 | NapCat access token |
 | bridge_url | http://127.0.0.1:5700 | onebot-qzone 桥接服务地址 |
 | bridge_token | 空 | onebot-qzone access token |
@@ -55,13 +55,13 @@ zhenxun_bot/
 
 1. 调用桥接服务 `check_cookie`（带网络探针）检测当前 Cookie 是否有效
 2. Cookie 仍有效则跳过，不触发变更（防风控）；预检失败则 fail-open 直接刷新
-3. 调用 NapCat `POST /get_cookies` 获取 QQ 空间 Cookie，校验包含 `uin` / `p_uin` / `skey` / `p_skey`
+3. 通过真寻已有的 OneBot 连接调用 NapCat `get_cookies` 获取 QQ 空间 Cookie（失败时回退到 `napcat_url` HTTP API），校验包含 `uin` / `p_uin` / `skey` / `p_skey`
 4. 调用桥接服务 `update_cookie` 动态更新 Cookie，可选再次验证
 
 **前提条件**：
 
 - NapCat 版本 ≥ v4.18.0
-- NapCat 已开启 HTTP API 并登录 QQ
+- NapCat 已登录 QQ，并已连接到真寻
 - onebot-qzone 桥接服务正在运行
 
 ## 🎉 使用
@@ -73,14 +73,13 @@ zhenxun_bot/
 ## 🔧 工作原理
 
 ```
-┌──────────────┐  NapCat HTTP API  ┌──────────┐
-│              │ ◄────────────────► │  NapCat  │
-│  真寻插件     │  POST /get_cookies │ (QQ登录)  │
-│ (qzone_auto) │                    └──────────┘
-│              │  POST /update_cookie                ┌──────────────────┐  QQ空间Web API  ┌──────────┐
-│              │ ◄──────────────────────────────────► │  onebot-qzone    │ ◄─────────────► │  QQ空间   │
-│              │  POST /get_friend_feeds, /send_like  │  (桥接服务)      │   Cookie 认证    │  服务器   │
-└──────────────┘                                      └──────────────────┘
+真寻插件 ──OneBot get_cookies──► NapCat(QQ登录)
+   │
+   │ POST /update_cookie
+   ▼
+onebot-qzone(桥接服务) ──QQ空间Web API(Cookie)──► QQ空间服务器
+   ▲
+   └── POST /get_friend_feeds, /send_like
 ```
 
 点赞、拉时间线、Cookie 更新均通过 onebot-qzone 桥接服务的 OneBot v11 HTTP action 完成。
