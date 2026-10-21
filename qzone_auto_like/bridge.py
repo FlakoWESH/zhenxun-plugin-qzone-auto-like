@@ -9,6 +9,7 @@ onebot-qzone（qzone-onebot-bridge）是一个 Node/TypeScript 服务，把 QQ �
 - get_friend_feeds  ：拉取好友空间时间线（好友动态）
 - get_emotion_list  ：拉取指定用户（默认自己）的说说列表
 - send_like         ：给指定说说点赞
+- send_comment      ：给指定说说发表评论
 - get_login_info    ：查询桥接登录态
 
 统一走后端配置 bridge_url / bridge_token，鉴权用 `Authorization: Bearer <token>`
@@ -116,3 +117,12 @@ class QzoneBridgeClient:
         if user_id:
             params["user_id"] = str(user_id)
         await self.call_data("send_like", params)
+
+    async def send_comment(
+        self, tid: str, content: str, user_id: str = ""
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {"tid": str(tid), "content": content}
+        if user_id:
+            params["user_id"] = str(user_id)
+        data = await self.call_data("send_comment", params)
+        return data or {}

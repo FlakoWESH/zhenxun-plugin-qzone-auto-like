@@ -5,25 +5,26 @@ def get_plugin_extra() -> PluginExtraData:
     """获取插件扩展元数据"""
     return PluginExtraData(
         author="FlakoWESH",
-        version="1.2.0",
-        menu_type="空间功能",
+        version="1.3.0",
+        menu_type="一些工具",
         plugin_type="NORMAL",
-        introduction="自动点赞 QQ 空间好友说说，并可自动从 NapCat 刷新 Cookie。",
+        introduction="自动点赞与评论 QQ 空间好友说说，支持勿扰名单、评论名单和个人内容。",
         precautions=[
-            "自动点赞属于自动化操作，请遵守 QQ 空间使用规则。",
-            "默认关闭，需在后台显式开启 enable_auto_like。",
+            "自动点赞与评论属于自动化操作，请遵守 QQ 空间使用规则。",
+            "默认关闭，需管理员在后台或通过指令开启。",
+            "评论比点赞更容易触发风控，建议保留较小的每轮/每日上限。",
         ],
         configs=[
             RegisterConfig(
                 key="enable_auto_like",
                 value=False,
-                help="是否启用自动点赞功能（默认关闭）",
+                help="首次初始化时是否开启全局秒赞（之后以运行态配置为准）",
                 type=bool,
             ),
             RegisterConfig(
                 key="like_interval",
-                value=600,
-                help="点赞间隔时间（秒），两次点赞轮询之间的最小间隔",
+                value=120,
+                help="首次初始化时的监控间隔（秒），之后可用“设置监控间隔”修改",
                 type=int,
             ),
             RegisterConfig(
@@ -48,6 +49,30 @@ def get_plugin_extra() -> PluginExtraData:
                 key="daily_like_limit",
                 value=200,
                 help="每日最多点赞条数（0 表示不限制）",
+                type=int,
+            ),
+            RegisterConfig(
+                key="comment_max_per_round",
+                value=5,
+                help="每轮最多评论条数（0 表示不限制）",
+                type=int,
+            ),
+            RegisterConfig(
+                key="comment_daily_limit",
+                value=50,
+                help="每日最多评论条数（0 表示不限制）",
+                type=int,
+            ),
+            RegisterConfig(
+                key="comment_delay_min",
+                value=5,
+                help="单条评论之间的最小随机延迟（秒）",
+                type=int,
+            ),
+            RegisterConfig(
+                key="comment_delay_max",
+                value=15,
+                help="单条评论之间的最大随机延迟（秒）",
                 type=int,
             ),
             # ===== Cookie 自动刷新配置 =====

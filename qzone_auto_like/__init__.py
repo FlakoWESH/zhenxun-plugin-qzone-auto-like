@@ -1,26 +1,32 @@
-import time
 from datetime import datetime
 
 import nonebot
-from nonebot import get_driver, on_command
+from nonebot import get_driver
 from nonebot.adapters.onebot.v11 import Bot
-from nonebot.permission import SUPERUSER
 from nonebot.plugin import PluginMetadata
 from nonebot_plugin_apscheduler import scheduler
 
 from zhenxun.configs.config import Config
 from zhenxun.services.log import logger
-from zhenxun.utils.message import MessageUtils
 
 from .bridge import QzoneBridgeClient
+from .comment_service import AutoCommentService
+from .commands import register_commands
 from .config import get_plugin_extra
 from .cookie_refresher import CookieRefresher
+from .feed import FeedScanner
 from .like_service import AutoLikeService
+from .preferences import (
+    get_comment_allowed,
+    get_like_denied,
+    get_runtime_config,
+    touch_last_run,
+)
 
 __plugin_meta__ = PluginMetadata(
-    name="QQ空间说说自动点赞",
-    description="自动点赞QQ空间说说，支持Cookie自动刷新",
-    usage="空间点赞状态 - 查询自动点赞功能状态",
+    name="QQ空间互动",
+    description="自动点赞与评论QQ空间好友说说，支持勿扰名单、评论名单与个人内容。",
+    usage="发送“查看空间配置”或“查看我的空间设置”查看当前设置。",
     extra=get_plugin_extra().to_dict(),
 )
 
@@ -30,10 +36,9 @@ _CFG = "qzone_auto_like"
 _bridge: QzoneBridgeClient | None = None
 _cookie_refresher: CookieRefresher | None = None
 _like_service: AutoLikeService | None = None
+_comment_service: AutoCommentService | None = None
+_scanner: FeedScanner | None = None
 _bridge_conf: tuple | None = None
-
-# 上一轮点赞时间戳
-_last_like_run: float = 0.0
 
 
 def _get(key: str, default):
@@ -58,7 +63,8 @@ def _cookie_ready() -> bool:
 
 async def _ensure_services() -> None:
     """根据当前配置构建/重建服务实例（支持配置热更新、复用 session）。"""
-    global _bridge, _cookie_refresher, _like_service, _bridge_conf
+    global _bridge, _cookie_refresher, _like_service, _comment_service
+    global _scanner, _bridge_conf
 
     url = _get("bridge_url", "http://127.0.0.1:5700")
     token = _get("bridge_token", "")
@@ -71,7 +77,9 @@ async def _ensure_services() -> None:
         if _cookie_refresher is not None:
             await _cookie_refresher.close()
         _bridge = QzoneBridgeClient(url, token, timeout)
-        _like_service = AutoLikeService(_bridge)
+        _scanner = FeedScanner(_bridge)
+        _like_service = AutoLikeService(_bridge, _scanner)
+        _comment_service = AutoCommentService(_bridge, _scanner)
         _bridge_conf = conf
 
     if _get("enable_auto_cookie", False):
@@ -91,11 +99,10 @@ async def _ensure_services() -> None:
         _cookie_refresher = None
 
 
-async def _auto_like_tick() -> None:
-    """调度器周期调用：达到 like_interval 才执行一轮点赞。"""
-    global _last_like_run
-
-    if not _get("enable_auto_like", False):
+async def _interaction_tick() -> None:
+    """共享扫描：一次拉取时间线，按开关分别执行点赞和评论。"""
+    runtime = await get_runtime_config()
+    if not runtime.like_enabled and not runtime.comment_enabled:
         return
 
     if _get("enable_auto_cookie", False):
@@ -105,44 +112,78 @@ async def _auto_like_tick() -> None:
         if not _cookie_ready():
             return
 
-    interval = max(0, _get("like_interval", 600))
-    now = time.time()
-    if now - _last_like_run < interval:
-        return
+    now = datetime.now()
+    if runtime.last_run_at is not None:
+        last_run = runtime.last_run_at
+        if last_run.tzinfo is not None:
+            now = datetime.now(last_run.tzinfo)
+        elapsed = (now - last_run).total_seconds()
+        if elapsed < max(30, runtime.monitor_interval):
+            return
 
     try:
         bot = nonebot.get_bot()
-    except Exception:
+    except Exception:  # noqa: BLE001
         logger.warning("[qzone_auto_like] 未找到可用的 Bot 实例，跳过本轮")
         return
 
-    _last_like_run = now
-    qq = str(bot.self_id)
-
     await _ensure_services()
-    if _like_service is None:
+    if _scanner is None or _like_service is None or _comment_service is None:
         return
 
-    max_count = _get("max_like_count", 50)
-    delay_min = _get("like_random_delay_min", 2)
-    delay_max = _get("like_random_delay_max", 6)
-    daily_limit = _get("daily_like_limit", 200)
+    qq = str(bot.self_id)
 
     try:
-        stats = await _like_service.run_once(
-            qq=qq,
-            max_count=max_count,
-            delay_min=delay_min,
-            delay_max=delay_max,
-            daily_limit=daily_limit,
+        like_count = _get("max_like_count", 50) if runtime.like_enabled else 0
+        comment_count = (
+            _get("comment_max_per_round", 5) if runtime.comment_enabled else 0
         )
-        logger.info(
-            f"[qzone_auto_like] 点赞轮次完成 | 抓取={stats['fetched']} "
-            f"点赞={stats['liked']} 跳过={stats['skipped']} "
-            f"失败={stats['failed']} 达上限={stats['limit_reached']}"
-        )
+        comment_scan = comment_count * 3 if comment_count > 0 else 50
+        scan_num = max(1, like_count, comment_scan)
+        posts = await _scanner.scan(scan_num)
+        await touch_last_run(now)
+
+        if runtime.like_enabled:
+            denied = await get_like_denied(qq)
+            stats = await _like_service.run(
+                posts,
+                qq=qq,
+                delay_min=_get("like_random_delay_min", 2),
+                delay_max=_get("like_random_delay_max", 6),
+                daily_limit=_get("daily_like_limit", 200),
+                denied=denied,
+            )
+            logger.info(
+                f"[qzone_auto_like] 点赞轮次完成 | 抓取={stats['fetched']} "
+                f"点赞={stats['liked']} 跳过={stats['skipped']} "
+                f"失败={stats['failed']} 达上限={stats['limit_reached']}"
+            )
+
+        if runtime.comment_enabled:
+            allowed = await get_comment_allowed(qq)
+            if not allowed:
+                logger.info("[qzone_auto_like] 评论名单为空，跳过评论")
+            else:
+                stats = await _comment_service.run(
+                    posts,
+                    qq=qq,
+                    allowed=allowed,
+                    global_template=runtime.comment_template,
+                    max_per_round=_get("comment_max_per_round", 5),
+                    daily_limit=_get("comment_daily_limit", 50),
+                    delay_min=_get("comment_delay_min", 5),
+                    delay_max=_get("comment_delay_max", 15),
+                )
+                logger.info(
+                    f"[qzone_auto_like] 评论轮次完成 | 抓取={stats['fetched']} "
+                    f"评论={stats['commented']} 跳过={stats['skipped']} "
+                    f"失败={stats['failed']} 达上限={stats['limit_reached']}"
+                )
     except Exception as e:  # noqa: BLE001 - 主循环兜底，避免调度任务被移除
-        logger.error(f"[qzone_auto_like] 自动点赞出现错误: {e}")
+        logger.error(
+            f"[qzone_auto_like] 自动互动出现错误: {type(e).__name__}: {e!r}",
+            e=e,
+        )
 
 
 async def _cookie_tick() -> None:
@@ -158,69 +199,16 @@ async def _cookie_tick() -> None:
         logger.error(f"[qzone_auto_like] Cookie 检查出现错误: {e}")
 
 
-status_cmd = on_command("空间点赞状态", permission=SUPERUSER, priority=5, block=True)
-
-
-@status_cmd.handle()
-async def _():
-    """查询自动点赞状态"""
-    await _ensure_services()
-
-    like_enabled = _get("enable_auto_like", False)
-    cookie_enabled = _get("enable_auto_cookie", False)
-
-    msg = (
-        "QQ空间自动点赞状态\n"
-        f"自动点赞：{'已启用' if like_enabled else '已禁用'}\n"
-        f"点赞间隔：{_get('like_interval', 600)} 秒\n"
-        f"单轮上限：{_get('max_like_count', 50)} 条\n"
-        f"每日上限：{_get('daily_like_limit', 200) or '不限'}\n"
-    )
-
-    try:
-        from .models import QzoneLikeRecord
-
-        today_count = await QzoneLikeRecord.filter(
-            qq_number=str(nonebot.get_bot().self_id),
-            like_time__gte=datetime.now().replace(
-                hour=0, minute=0, second=0, microsecond=0
-            ),
-        ).count()
-        msg += f"今日已点赞：{today_count} 条\n"
-    except Exception:  # noqa: BLE001
-        pass
-
-    if cookie_enabled and _cookie_refresher is not None:
-        s = _cookie_refresher.get_status()
-        msg += "\n─── Cookie 自动刷新 ───\n"
-        msg += f"刷新间隔：{s['refresh_interval']} 秒\n"
-        if s["last_refresh_time"]:
-            last_time = datetime.fromtimestamp(s["last_refresh_time"]).strftime(
-                "%Y-%m-%d %H:%M:%S"
-            )
-            if s["last_refresh_success"]:
-                msg += f"上次刷新：{last_time} 成功\n"
-            else:
-                msg += f"上次刷新：{last_time} 失败\n错误：{s['last_error'] or '未知'}\n"
-        else:
-            msg += "上次刷新：尚未执行\n"
-        msg += f"累计刷新：{s['refresh_count']} 次"
-    else:
-        msg += "\nCookie 自动刷新：未启用"
-
-    await MessageUtils.build_message(msg).finish()
-
-
 driver = get_driver()
 
 
 @driver.on_startup
 async def _startup():
     scheduler.add_job(
-        _auto_like_tick,
+        _interaction_tick,
         "interval",
         seconds=30,
-        id="qzone_auto_like_tick",
+        id="qzone_interaction_tick",
         max_instances=1,
         coalesce=True,
         replace_existing=True,
@@ -239,7 +227,7 @@ async def _startup():
 
 @driver.on_bot_connect
 async def _on_bot_connect(_bot: Bot) -> None:
-    """Bot 连接 NapCat 后立即刷新 Cookie，避免首轮点赞因无 Cookie 失败。"""
+    """Bot 连接 NapCat 后立即刷新 Cookie，避免首轮互动因无 Cookie 失败。"""
     if not _get("enable_auto_cookie", False):
         return
     await _ensure_services()
@@ -253,3 +241,6 @@ async def _shutdown():
         await _cookie_refresher.close()
     elif _bridge is not None:
         await _bridge.close()
+
+
+register_commands()
