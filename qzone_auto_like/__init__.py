@@ -9,7 +9,7 @@ from nonebot_plugin_apscheduler import scheduler
 from zhenxun.configs.config import Config
 from zhenxun.services.log import logger
 
-from .bridge import QzoneBridgeClient
+from .bridge import BridgeAuthError, QzoneBridgeClient
 from .comment_service import AutoCommentService
 from .commands import register_commands
 from .config import get_plugin_extra
@@ -119,6 +119,20 @@ async def _ensure_services() -> None:
         _cookie_refresher = None
 
 
+async def _scan_with_cookie_retry(scan_num: int):
+    """拉取时间线；登录态失效时立即刷新 Cookie 并重试一次。"""
+    try:
+        return await _scanner.scan(scan_num)
+    except BridgeAuthError:
+        if not _get("enable_auto_cookie", False) or _cookie_refresher is None:
+            raise
+        logger.warning("[qzone_auto_like] 桥接登录态失效，立即刷新 Cookie 后重试")
+        refreshed, _error = await _cookie_refresher.refresh_once(force=True)
+        if not refreshed:
+            raise
+        return await _scanner.scan(scan_num)
+
+
 async def _interaction_tick() -> None:
     """共享扫描：一次拉取时间线，按开关分别执行点赞和评论。"""
     runtime = await get_runtime_config()
@@ -160,7 +174,7 @@ async def _interaction_tick() -> None:
         )
         comment_scan = comment_count * 3 if comment_count > 0 else 50
         scan_num = max(1, like_count, comment_scan)
-        posts = await _scanner.scan(scan_num)
+        posts = await _scan_with_cookie_retry(scan_num)
         await touch_last_run(now)
 
         if runtime.like_enabled:
@@ -199,6 +213,12 @@ async def _interaction_tick() -> None:
                     f"评论={stats['commented']} 跳过={stats['skipped']} "
                     f"失败={stats['failed']} 达上限={stats['limit_reached']}"
                 )
+    except BridgeAuthError as e:
+        await touch_last_run(now)
+        logger.error(
+            f"[qzone_auto_like] 自动互动出现错误: {type(e).__name__}: {e!r}",
+            e=e,
+        )
     except Exception as e:  # noqa: BLE001 - 主循环兜底，避免调度任务被移除
         logger.error(
             f"[qzone_auto_like] 自动互动出现错误: {type(e).__name__}: {e!r}",
